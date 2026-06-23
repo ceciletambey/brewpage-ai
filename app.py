@@ -94,7 +94,9 @@ Return ONLY a JSON object, no markdown:
 def cta_link_for(shop):
     """A CTA needs a real destination or the button is dead. Map each
     conversion goal to something that actually does something on click."""
-    place = urllib.parse.quote(f"{shop['name']} {shop['location']}")
+    address = shop.get("address", "").strip()
+    query = address if address else f"{shop['name']} {shop['location']}"
+    place = urllib.parse.quote(query)
     return {
         "Get people to visit in person":
             f"https://www.google.com/maps/search/?api=1&query={place}",
@@ -290,6 +292,13 @@ c1, c2 = st.columns(2)
 with c1:
     name = st.text_input("Shop name", "Ember & Oak")
     location = st.text_input("Location / setting", "A quiet corner in Lavapiés, Madrid")
+    address = st.text_input(
+        "Street address (optional, for the map link)", "",
+        placeholder="e.g. Calle de la Cabeza 12, 28012 Madrid",
+        help="Only used for the 'visit in person' button. Leave blank if this "
+             "is a fictional shop — without a real address, Google Maps will "
+             "guess the nearest match instead of finding this exact place.",
+    )
     vibe = st.text_input("Vibe / atmosphere", "Cozy, slow, lots of plants and warm wood")
 with c2:
     differentiator = st.text_input("What makes it different",
@@ -300,8 +309,14 @@ with c2:
         ["Get people to visit in person", "Drive online orders / pre-orders",
          "Sign up for a loyalty program", "Book the space for events"])
 
-shop = {"name": name, "location": location, "vibe": vibe,
+shop = {"name": name, "location": location, "address": address, "vibe": vibe,
         "differentiator": differentiator, "target": target, "goal": goal}
+
+if goal == "Get people to visit in person" and not address.strip():
+    st.caption(
+        "No street address entered — the map button will guess the nearest "
+        "match for the shop name instead of pointing at a real place."
+    )
 
 if st.button("Generate page", type="primary", disabled=not api_key):
     with st.spinner("1/3 — Strategist is making the marketing decisions"):
