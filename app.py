@@ -25,6 +25,7 @@ import threading
 import time
 import queue
 import urllib.parse
+import urllib.request
 import streamlit as st
 import streamlit.components.v1 as components
 import google.generativeai as genai
@@ -54,6 +55,18 @@ def call_model(prompt, temperature=0.7):
 def parse_json(raw):
     clean = raw.strip().replace("```json", "").replace("```html", "").replace("```", "").strip()
     return json.loads(clean)
+
+
+def _open_links_in_new_tab(html):
+    """The generated page is shown inside an embedded iframe — without this,
+    clicking a CTA navigates the iframe itself instead of opening the
+    destination, which looks like the click just bounces back to the app."""
+    def add_target(m):
+        attrs = m.group(1)
+        if "target=" in attrs:
+            return m.group(0)
+        return f'<a{attrs} target="_blank" rel="noopener noreferrer"{m.group(2)}>'
+    return re.sub(r"<a\b([^>]*?)(/?)>", add_target, html, flags=re.IGNORECASE)
 
 
 # ----------------------------------------------------------------------------
@@ -163,7 +176,8 @@ RULES:
 
 Return ONLY the raw HTML, starting with <!DOCTYPE html>. No markdown fences."""
     raw = call_model(prompt, temperature=0.8)
-    return raw.strip().replace("```html", "").replace("```", "").strip()
+    html = raw.strip().replace("```html", "").replace("```", "").strip()
+    return _open_links_in_new_tab(html)
 
 
 # ----------------------------------------------------------------------------
@@ -203,22 +217,6 @@ def strategy_to_md(shop, strategy):
     lines += ["**Key messages:**", ""]
     lines += [f"- {m}" for m in strategy["key_messages"]]
     return "\n".join(lines) + "\n"
-
-
-def generator_to_md(shop, cta_link):
-    return f"""# Generator — {shop['name']}
-
-**Output:** one self-contained HTML landing page (see `landing_page.html`).
-
-**CTA destination used on every button:** {cta_link}
-
-**Sections produced:** sticky nav, hero, 3-column value grid, atmosphere/about
-block, social-proof strip, footer with final CTA.
-
-**Design brief given to the model:** one deliberate color story (not a
-rainbow gradient), a display-serif/sans-serif font pairing, an 8px spacing
-scale, subtle hover states on buttons, mobile-responsive grid.
-"""
 
 
 def score_to_md(shop, review):
@@ -274,19 +272,35 @@ def stop_live_link():
 
 def start_live_link(html):
     stop_live_link()
-    tmp_dir = tempfile.mkdtemp(prefix="brewpage_")
-    with open(os.path.join(tmp_dir, "index.html"), "w") as f:
-        f.write(html)
+    cloudflared = shutil.which("cloudflared")
+    if not cloudflared:
+        return None, (
+            "Public website links need the Cloudflare tunnel CLI (`cloudflared`) "
+            "installed on this machine. HTML download still works."
+        )
 
-    port = _free_port()
-    server_proc = subprocess.Popen(
-        ["python3", "-m", "http.server", str(port), "--bind", "127.0.0.1"],
-        cwd=tmp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    tunnel_proc = subprocess.Popen(
-        ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-    )
+    tmp_dir = tempfile.mkdtemp(prefix="brewpage_")
+    server_proc = tunnel_proc = None
+    try:
+        with open(os.path.join(tmp_dir, "index.html"), "w", encoding="utf-8") as f:
+            f.write(html)
+
+        port = _free_port()
+        server_proc = subprocess.Popen(
+            ["python3", "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+            cwd=tmp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        tunnel_proc = subprocess.Popen(
+            [cloudflared, "tunnel", "--url", f"http://127.0.0.1:{port}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+    except Exception as exc:
+        if server_proc and server_proc.poll() is None:
+            server_proc.terminate()
+        if tunnel_proc and tunnel_proc.poll() is None:
+            tunnel_proc.terminate()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None, f"Could not start the public website link: {exc}"
 
     lines = queue.Queue()
     threading.Thread(
@@ -311,7 +325,7 @@ def start_live_link(html):
         server_proc.terminate()
         tunnel_proc.terminate()
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        return None
+        return None, "Cloudflare did not return a public URL in time. Try again."
 
     # the hostname needs a few seconds to propagate through DNS before it's
     # actually reachable — wait for a real 200 instead of handing back a
@@ -319,12 +333,9 @@ def start_live_link(html):
     reachable, verify_deadline = False, time.time() + 45
     while time.time() < verify_deadline:
         try:
-            check = subprocess.run(
-                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                 "--max-time", "5", url],
-                capture_output=True, text=True, timeout=7,
-            )
-            if check.stdout.strip() == "200":
+            with urllib.request.urlopen(url, timeout=5) as check:
+                status = getattr(check, "status", check.getcode())
+            if status == 200:
                 reachable = True
                 break
         except Exception:
@@ -335,13 +346,16 @@ def start_live_link(html):
         server_proc.terminate()
         tunnel_proc.terminate()
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        return None
+        return None, (
+            "The public URL was created but did not become reachable in time. "
+            "Try again, or use the HTML download."
+        )
 
     st.session_state["live_link"] = {
         "url": url, "tmp_dir": tmp_dir,
         "server_proc": server_proc, "tunnel_proc": tunnel_proc,
     }
-    return url
+    return url, None
 
 
 # ----------------------------------------------------------------------------
@@ -352,23 +366,34 @@ st.set_page_config(page_title="BrewPage", page_icon=None, layout="wide")
 st.markdown("""
 <style>
 .block-container { padding-top: 3rem; max-width: 980px; }
-h1 { font-weight: 600; letter-spacing: -0.02em; }
+h1 { font-weight: 600; letter-spacing: -0.02em; color: #1e5638; }
 .bp-overline {
     text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.75rem;
-    color: #8a8a8a; margin-bottom: 0.25rem;
+    color: #2e7d4f; margin-bottom: 0.25rem;
 }
-.bp-rule { border: none; border-top: 1px solid #e6e6e4; margin: 1.75rem 0; }
-[data-testid="stMetricValue"] { font-weight: 600; }
+.bp-rule { border: none; border-top: 1px solid #d9ece0; margin: 1.75rem 0; }
+[data-testid="stMetricValue"] { font-weight: 600; color: #1e5638; }
+.stButton > button[kind="primary"] { background-color: #2e7d4f; border-color: #2e7d4f; }
+.stButton > button[kind="primary"]:hover { background-color: #256241; border-color: #256241; }
 </style>
 """, unsafe_allow_html=True)
 
-api_key = os.environ.get("GEMINI_API_KEY", "")
+try:
+    secrets_api_key = st.secrets.get("GEMINI_API_KEY", "")
+except Exception:
+    secrets_api_key = ""
+api_key = os.environ.get("GEMINI_API_KEY", "") or secrets_api_key
+
 if api_key:
     genai.configure(api_key=api_key)
 
 if "atexit_registered" not in st.session_state:
     atexit.register(stop_live_link)
     st.session_state["atexit_registered"] = True
+
+if not public_link_enabled:
+    stop_live_link()
+    st.session_state.pop("share_error", None)
 
 st.markdown('<div class="bp-overline">Marketing strategy → landing page</div>',
             unsafe_allow_html=True)
@@ -378,8 +403,8 @@ st.caption("Makes the marketing decisions a strategist would — positioning, "
            "page for an independent coffee shop.")
 
 if not api_key:
-    st.error("No GEMINI_API_KEY found. Add it to a .env file in the project "
-             "root: GEMINI_API_KEY=your_key")
+    st.error("Add GEMINI_API_KEY to a .env file in the project root, then "
+             "restart the app.")
 
 with st.expander("Pipeline & rubric"):
     st.markdown("**Pipeline:** Strategist → Generator → Scorer")
@@ -404,8 +429,24 @@ with c2:
 shop = {"name": name, "location": location, "vibe": vibe,
         "differentiator": differentiator, "target": target, "goal": goal}
 
+cloudflared_path = shutil.which("cloudflared")
+public_link_enabled = st.checkbox(
+    "Create temporary public website link",
+    value=False,
+    disabled=not bool(cloudflared_path),
+    help=(
+        "Uses a Cloudflare quick tunnel to turn the generated HTML into a "
+        "real URL while this Streamlit app is running."
+    ),
+)
+if not cloudflared_path:
+    st.caption("Public links need the `cloudflared` CLI installed.")
+elif public_link_enabled:
+    st.caption("The website link is temporary and stops when this app stops.")
+
 if st.button("Generate page", type="primary", disabled=not api_key):
     stop_live_link()
+    st.session_state.pop("share_error", None)
     with st.spinner("1/3 — Strategist is making the marketing decisions"):
         strategy = make_strategy(shop)
     with st.spinner("2/3 — Generator is building the landing page"):
@@ -414,33 +455,52 @@ if st.button("Generate page", type="primary", disabled=not api_key):
         review = score_page(shop, strategy, page_html)
 
     # stash for the report tab
-    st.session_state["last"] = {"strategy": strategy, "html": page_html, "review": review}
+    st.session_state["last"] = {
+        "shop": shop.copy(),
+        "strategy": strategy,
+        "html": page_html,
+        "review": review,
+    }
+
+    if public_link_enabled:
+        with st.spinner("Creating a temporary public website link"):
+            _, error = start_live_link(page_html)
+        if error:
+            st.session_state["share_error"] = error
 
 if "last" in st.session_state:
     data = st.session_state["last"]
+    generated_shop = data.get("shop", shop)
     tab_page, tab_strategy, tab_score = st.tabs(["Page", "Strategy", "Score"])
 
     with tab_page:
         components.html(data["html"], height=700, scrolling=True)
 
         live = st.session_state.get("live_link")
-        b1, b2, b3, b4 = st.columns([1.3, 1.3, 1, 2])
+        share_error = st.session_state.get("share_error")
+        b1, b2 = st.columns([1.3, 1])
         with b1:
             st.download_button("Download page (HTML)", data["html"],
                                file_name="landing_page.html", mime="text/html")
         with b2:
-            st.download_button("Download generator output (.md)",
-                               generator_to_md(shop, cta_link_for(shop)),
-                               file_name="generator.md", mime="text/markdown")
-        with b3:
-            if st.button("Get public link"):
+            if public_link_enabled and st.button("Create link"):
                 with st.spinner("Opening a public tunnel and waiting for it "
                                  "to come online (up to ~45s)"):
-                    url = start_live_link(data["html"])
-                if not url:
-                    st.error("Tunnel didn't come online in time. Try again.")
+                    _, error = start_live_link(data["html"])
+                if error:
+                    st.session_state["share_error"] = error
                 else:
+                    st.session_state.pop("share_error", None)
                     st.rerun()
+
+        if share_error:
+            st.error(share_error)
+
+        if not public_link_enabled:
+            st.caption(
+                "HTML-only mode is on. Check “Create temporary public website "
+                "link” above if you need a real URL."
+            )
 
         if live:
             st.success(f"Live now: {live['url']}")
@@ -466,7 +526,7 @@ if "last" in st.session_state:
         st.caption("This is the marketing-thinking step — the part that "
                    "separates this from a generic website builder.")
         st.download_button("Download strategist output (.md)",
-                           strategy_to_md(shop, s),
+                           strategy_to_md(generated_shop, s),
                            file_name="strategist.md", mime="text/markdown")
 
     with tab_score:

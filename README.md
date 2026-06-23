@@ -25,9 +25,17 @@ a marketing project, not a website generator.
 pip install -r requirements.txt
 streamlit run app.py
 ```
-Paste a free Gemini key (aistudio.google.com/apikey) in the sidebar. Fill in the
-coffee shop details, hit **Generate page**, and you get three tabs: the live page,
-the strategy behind it, and the score.
+Get a free Gemini key (aistudio.google.com/apikey) and put it in a `.env` file in
+the project root: `GEMINI_API_KEY=your_key`. (When deployed on Streamlit
+Community Cloud, set it instead via the app's Secrets panel.) Fill in the coffee
+shop details, hit **Generate page**, and you get three tabs: the live page, the
+strategy behind it, and the score.
+
+By default the app creates a downloadable HTML page. If you need a real,
+shareable website URL, check **Create temporary public website link** before
+generating. That option uses a free Cloudflare quick tunnel, so it requires the
+`cloudflared` CLI on your machine and the link only stays online while the
+Streamlit app is running.
 
 ## What to put in the report
 1. **Problem** — small cafes need strategy-driven web presence, not templates.
