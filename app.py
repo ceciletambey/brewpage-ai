@@ -391,10 +391,6 @@ if "atexit_registered" not in st.session_state:
     atexit.register(stop_live_link)
     st.session_state["atexit_registered"] = True
 
-if not public_link_enabled:
-    stop_live_link()
-    st.session_state.pop("share_error", None)
-
 st.markdown('<div class="bp-overline">Marketing strategy → landing page</div>',
             unsafe_allow_html=True)
 st.title("BrewPage")
@@ -443,6 +439,10 @@ if not cloudflared_path:
     st.caption("Public links need the `cloudflared` CLI installed.")
 elif public_link_enabled:
     st.caption("The website link is temporary and stops when this app stops.")
+
+if not public_link_enabled:
+    stop_live_link()
+    st.session_state.pop("share_error", None)
 
 if st.button("Generate page", type="primary", disabled=not api_key):
     stop_live_link()
