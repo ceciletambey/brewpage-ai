@@ -14,18 +14,9 @@ Needs: GEMINI_API_KEY set in a .env file in the project root
 """
 
 import os
-import atexit
 import json
 import re
-import shutil
-import socket
-import subprocess
-import tempfile
-import threading
-import time
-import queue
 import urllib.parse
-import urllib.request
 import streamlit as st
 import streamlit.components.v1 as components
 import google.generativeai as genai
@@ -250,115 +241,6 @@ def score_label(avg):
 
 
 # ----------------------------------------------------------------------------
-# LIVE LINK — serve the generated page over a free Cloudflare quick tunnel
-# so it's a real, clickable public URL, not just a download.
-# ----------------------------------------------------------------------------
-def _free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-def stop_live_link():
-    link = st.session_state.get("live_link")
-    if not link:
-        return
-    for proc in (link["tunnel_proc"], link["server_proc"]):
-        if proc.poll() is None:
-            proc.terminate()
-    shutil.rmtree(link["tmp_dir"], ignore_errors=True)
-    st.session_state.pop("live_link", None)
-
-
-def start_live_link(html):
-    stop_live_link()
-    cloudflared = shutil.which("cloudflared")
-    if not cloudflared:
-        return None, (
-            "Public website links need the Cloudflare tunnel CLI (`cloudflared`) "
-            "installed on this machine. HTML download still works."
-        )
-
-    tmp_dir = tempfile.mkdtemp(prefix="brewpage_")
-    server_proc = tunnel_proc = None
-    try:
-        with open(os.path.join(tmp_dir, "index.html"), "w", encoding="utf-8") as f:
-            f.write(html)
-
-        port = _free_port()
-        server_proc = subprocess.Popen(
-            ["python3", "-m", "http.server", str(port), "--bind", "127.0.0.1"],
-            cwd=tmp_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        tunnel_proc = subprocess.Popen(
-            [cloudflared, "tunnel", "--url", f"http://127.0.0.1:{port}"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        )
-    except Exception as exc:
-        if server_proc and server_proc.poll() is None:
-            server_proc.terminate()
-        if tunnel_proc and tunnel_proc.poll() is None:
-            tunnel_proc.terminate()
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return None, f"Could not start the public website link: {exc}"
-
-    lines = queue.Queue()
-    threading.Thread(
-        target=lambda: [lines.put(l) for l in tunnel_proc.stdout] or lines.put(None),
-        daemon=True,
-    ).start()
-
-    url, deadline = None, time.time() + 25
-    while time.time() < deadline:
-        try:
-            line = lines.get(timeout=1)
-        except queue.Empty:
-            continue
-        if line is None:
-            break
-        match = re.search(r"https://[a-zA-Z0-9.-]+\.trycloudflare\.com", line)
-        if match:
-            url = match.group(0)
-            break
-
-    if not url:
-        server_proc.terminate()
-        tunnel_proc.terminate()
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return None, "Cloudflare did not return a public URL in time. Try again."
-
-    # the hostname needs a few seconds to propagate through DNS before it's
-    # actually reachable — wait for a real 200 instead of handing back a
-    # link that 404s/NXDOMAINs the instant the user clicks it.
-    reachable, verify_deadline = False, time.time() + 45
-    while time.time() < verify_deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=5) as check:
-                status = getattr(check, "status", check.getcode())
-            if status == 200:
-                reachable = True
-                break
-        except Exception:
-            pass
-        time.sleep(1.5)
-
-    if not reachable:
-        server_proc.terminate()
-        tunnel_proc.terminate()
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return None, (
-            "The public URL was created but did not become reachable in time. "
-            "Try again, or use the HTML download."
-        )
-
-    st.session_state["live_link"] = {
-        "url": url, "tmp_dir": tmp_dir,
-        "server_proc": server_proc, "tunnel_proc": tunnel_proc,
-    }
-    return url, None
-
-
-# ----------------------------------------------------------------------------
 # STREAMLIT UI
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="BrewPage", page_icon=None, layout="wide")
@@ -386,10 +268,6 @@ api_key = os.environ.get("GEMINI_API_KEY", "") or secrets_api_key
 
 if api_key:
     genai.configure(api_key=api_key)
-
-if "atexit_registered" not in st.session_state:
-    atexit.register(stop_live_link)
-    st.session_state["atexit_registered"] = True
 
 st.markdown('<div class="bp-overline">Marketing strategy → landing page</div>',
             unsafe_allow_html=True)
@@ -425,28 +303,7 @@ with c2:
 shop = {"name": name, "location": location, "vibe": vibe,
         "differentiator": differentiator, "target": target, "goal": goal}
 
-cloudflared_path = shutil.which("cloudflared")
-public_link_enabled = st.checkbox(
-    "Create temporary public website link",
-    value=False,
-    disabled=not bool(cloudflared_path),
-    help=(
-        "Uses a Cloudflare quick tunnel to turn the generated HTML into a "
-        "real URL while this Streamlit app is running."
-    ),
-)
-if not cloudflared_path:
-    st.caption("Public links need the `cloudflared` CLI installed.")
-elif public_link_enabled:
-    st.caption("The website link is temporary and stops when this app stops.")
-
-if not public_link_enabled:
-    stop_live_link()
-    st.session_state.pop("share_error", None)
-
 if st.button("Generate page", type="primary", disabled=not api_key):
-    stop_live_link()
-    st.session_state.pop("share_error", None)
     with st.spinner("1/3 — Strategist is making the marketing decisions"):
         strategy = make_strategy(shop)
     with st.spinner("2/3 — Generator is building the landing page"):
@@ -462,12 +319,6 @@ if st.button("Generate page", type="primary", disabled=not api_key):
         "review": review,
     }
 
-    if public_link_enabled:
-        with st.spinner("Creating a temporary public website link"):
-            _, error = start_live_link(page_html)
-        if error:
-            st.session_state["share_error"] = error
-
 if "last" in st.session_state:
     data = st.session_state["last"]
     generated_shop = data.get("shop", shop)
@@ -475,43 +326,8 @@ if "last" in st.session_state:
 
     with tab_page:
         components.html(data["html"], height=700, scrolling=True)
-
-        live = st.session_state.get("live_link")
-        share_error = st.session_state.get("share_error")
-        b1, b2 = st.columns([1.3, 1])
-        with b1:
-            st.download_button("Download page (HTML)", data["html"],
-                               file_name="landing_page.html", mime="text/html")
-        with b2:
-            if public_link_enabled and st.button("Create link"):
-                with st.spinner("Opening a public tunnel and waiting for it "
-                                 "to come online (up to ~45s)"):
-                    _, error = start_live_link(data["html"])
-                if error:
-                    st.session_state["share_error"] = error
-                else:
-                    st.session_state.pop("share_error", None)
-                    st.rerun()
-
-        if share_error:
-            st.error(share_error)
-
-        if not public_link_enabled:
-            st.caption(
-                "HTML-only mode is on. Check “Create temporary public website "
-                "link” above if you need a real URL."
-            )
-
-        if live:
-            st.success(f"Live now: {live['url']}")
-            st.caption(
-                "Anyone with this link can open the page right now. It's a "
-                "free Cloudflare quick tunnel to a server on this machine — "
-                "no account, but it stays up only while this app is running."
-            )
-            if st.button("Stop public link"):
-                stop_live_link()
-                st.rerun()
+        st.download_button("Download page (HTML)", data["html"],
+                           file_name="landing_page.html", mime="text/html")
 
     with tab_strategy:
         s = data["strategy"]
