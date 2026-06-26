@@ -2,199 +2,51 @@
 BrewPage — AI Marketing Strategy → Landing Page Engine for Coffee Shops
 Big Data & AI in Marketing — Individual Assignment
 
-Pipeline (two agents):
-  1. STRATEGIST agent  -> makes the marketing decisions a strategist would:
+Pipeline (a LangGraph graph, see graph.py):
+  1. STRATEGIST node  -> makes the marketing decisions a strategist would:
         positioning, target customer, value proposition, tone, conversion goal.
-  2. GENERATOR agent   -> turns that strategy into a real, styled landing page.
-  3. (light) SCORER    -> self-scores the page on a marketing rubric so you have
-        numbers to analyze in the report.
+  2. GENERATOR node   -> turns that strategy into a real, styled landing page.
+  3. EDITOR node       -> (on demand) revises the page based on your feedback,
+        in a loop — give notes, get a revised page, repeat.
 
 Run:  streamlit run app.py
 Needs: GEMINI_API_KEY set in a .env file in the project root
 """
 
 import os
-import json
-import re
-import urllib.parse
 import streamlit as st
 import streamlit.components.v1 as components
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+from graph import STEP_LABELS, get_pipeline, get_editor_pipeline, image_to_data_uri, _inject_images
+
 load_dotenv()
 
-MODEL_NAME = "gemini-2.5-flash"
 
-RUBRIC = [
-    "positioning",     # is it clearly differentiated from generic cafes?
-    "audience_fit",    # does copy speak to the stated target customer?
-    "value_clarity",   # is the core value proposition obvious & specific?
-    "cta_strength",    # is there one clear conversion goal?
-    "tone_consistency" # does the voice stay consistent & on-brief?
-]
-
-# ----------------------------------------------------------------------------
-# LLM HELPERS
-# ----------------------------------------------------------------------------
-def call_model(prompt, temperature=0.7):
-    model = genai.GenerativeModel(MODEL_NAME)
-    resp = model.generate_content(prompt, generation_config={"temperature": temperature})
-    return resp.text
+def run_pipeline(shop, images, status_box):
+    """Streams the LangGraph pipeline node-by-node so the UI can report
+    progress, and returns the final accumulated state."""
+    state = {"shop": shop, "images": images}
+    for update in get_pipeline().stream(state, stream_mode="updates"):
+        for node_name, partial in update.items():
+            state.update(partial)
+            status_box.write(STEP_LABELS.get(node_name, node_name))
+    return state
 
 
-def parse_json(raw):
-    clean = raw.strip().replace("```json", "").replace("```html", "").replace("```", "").strip()
-    return json.loads(clean)
-
-
-def _open_links_in_new_tab(html):
-    """The generated page is shown inside an embedded iframe — without this,
-    clicking a CTA navigates the iframe itself instead of opening the
-    destination, which looks like the click just bounces back to the app."""
-    def add_target(m):
-        attrs = m.group(1)
-        if "target=" in attrs:
-            return m.group(0)
-        return f'<a{attrs} target="_blank" rel="noopener noreferrer"{m.group(2)}>'
-    return re.sub(r"<a\b([^>]*?)(/?)>", add_target, html, flags=re.IGNORECASE)
-
-
-# ----------------------------------------------------------------------------
-# AGENT 1 — STRATEGIST  (the marketing brain)
-# ----------------------------------------------------------------------------
-def make_strategy(shop):
-    prompt = f"""You are a senior brand strategist for small hospitality businesses.
-A coffee shop owner gives you raw notes. Turn them into a sharp marketing strategy.
-Do NOT write website copy yet — make the strategic DECISIONS first.
-
-COFFEE SHOP NOTES:
-- Name: {shop['name']}
-- Location / setting: {shop['location']}
-- What makes it different: {shop['differentiator']}
-- Vibe / atmosphere: {shop['vibe']}
-- Target customer (owner's guess): {shop['target']}
-- Main goal of the page: {shop['goal']}
-
-Return ONLY a JSON object, no markdown:
-{{
-  "positioning": "one sentence: how this shop is positioned vs. generic cafes",
-  "target_customer": "a crisp persona — who exactly we're talking to",
-  "value_proposition": "the single most compelling reason to visit",
-  "tone": "3-4 adjectives describing the voice",
-  "conversion_goal": "the ONE action the page should drive",
-  "key_messages": ["3 supporting points the page should make"]
-}}"""
-    return parse_json(call_model(prompt, temperature=0.6))
-
-
-# ----------------------------------------------------------------------------
-# AGENT 2 — GENERATOR  (strategy -> real landing page)
-# ----------------------------------------------------------------------------
-def cta_link_for(shop):
-    """A CTA needs a real destination or the button is dead. Map each
-    conversion goal to something that actually does something on click."""
-    address = shop.get("address", "").strip()
-    query = address if address else f"{shop['name']} {shop['location']}"
-    place = urllib.parse.quote(query)
-    return {
-        "Get people to visit in person":
-            f"https://www.google.com/maps/search/?api=1&query={place}",
-        "Drive online orders / pre-orders":
-            "mailto:hello@example.com?subject=Order%20Inquiry",
-        "Sign up for a loyalty program":
-            "mailto:hello@example.com?subject=Loyalty%20Program%20Sign-up",
-        "Book the space for events":
-            "mailto:hello@example.com?subject=Event%20Booking%20Inquiry",
-    }.get(shop["goal"], "mailto:hello@example.com")
-
-
-def make_page(shop, strategy):
-    cta_link = cta_link_for(shop)
-    prompt = f"""You are a senior designer at a boutique branding studio — the
-kind hired by independent cafes who want to look like a real brand, not a
-template. Build a complete, single-file HTML landing page for this coffee
-shop, executing the marketing strategy below precisely.
-
-SHOP: {shop['name']} — {shop['location']}
-STRATEGY:
-{json.dumps(strategy, indent=2)}
-
-CTA_LINK (use this exact URL, do not invent your own): {cta_link}
-
-STRUCTURE (in order):
-1. Slim sticky nav: shop name (or a simple monogram/wordmark) on the left,
-   one nav link or two, and a compact CTA button on the right.
-2. Hero: headline + subhead executing the positioning, primary CTA button.
-   Give it a real focal point (a large gradient/duotone panel standing in
-   for a photo) — not just centered text on a flat color.
-3. A 3-column "why us" grid built from the key messages, each with a small
-   abstract icon (inline SVG or a styled CSS shape/emoji-free glyph) + a
-   short headline + one line of copy. Avoid walls of text.
-4. Atmosphere/about section: pairs a short paragraph with a visual block
-   (placeholder gradient standing in for a photo) in an asymmetric two-
-   column layout — alternate image-left/image-right if there's more than
-   one such section.
-5. A single-line "social proof" strip (e.g. a short quote in italics, or
-   3 stat-style callouts like "Locally roasted" / "Open since ..." /
-   neighborhood name) — keep this invented but plausible, never fake review
-   counts or star ratings.
-6. Footer: address/neighborhood, a final CTA button, minimal links.
-
-DESIGN BAR (this is the part most AI-generated pages get wrong — fix it):
-- Pick ONE deliberate color story from the vibe (e.g. a deep warm neutral +
-  one accent), not a rainbow gradient. Background should mostly be a single
-  calm tone; use the accent sparingly (CTA, small details).
-- Pair a distinctive display serif or slab for headlines with a clean
-  sans-serif for body text (load via Google Fonts <link>). No default
-  system-font look.
-- Use a consistent spacing scale (e.g. multiples of 8px) and generous
-  whitespace — most amateur pages are too cramped.
-- Buttons: one consistent style, rounded, with a visible hover state
-  (transform/opacity transition) — not a flat unstyled <a>.
-- Subtle details only: soft shadows, thin 1px borders, occasional rounded
-  corners. No heavy drop-shadows, no neon, no more than one gradient on the
-  whole page.
-- Mobile-friendly: stack the grid/columns under ~700px.
-
-RULES:
-- ONE self-contained HTML file. All CSS in a <style> tag. No external JS
-  frameworks. Google Fonts <link> is allowed.
-- EVERY CTA button (nav, hero, footer) must be a real `<a href="{cta_link}">`
-  styled as a button. Never use href="#" — it must actually navigate or
-  open mail/maps when clicked.
-- Use placeholder gradients/duotone panels instead of real images.
-- Copy must execute the positioning, tone, and value proposition above —
-  specific to this shop, never generic stock-cafe copy.
-
-Return ONLY the raw HTML, starting with <!DOCTYPE html>. No markdown fences."""
-    raw = call_model(prompt, temperature=0.8)
-    html = raw.strip().replace("```html", "").replace("```", "").strip()
-    return _open_links_in_new_tab(html)
-
-
-# ----------------------------------------------------------------------------
-# LIGHT SCORER  (numbers for the report)
-# ----------------------------------------------------------------------------
-def score_page(shop, strategy, page_html):
-    prompt = f"""You are a strict marketing reviewer grading a junior copywriter's
-work. You are hard to impress — a 5/5 is rare and means you found zero
-faults. Most competent pages should land at 3-4. If you can name ANY
-weakness for a dimension in your notes, that dimension cannot score above 4.
-
-STRATEGY:
-{json.dumps(strategy, indent=2)}
-
-PAGE HTML (copy matters, ignore styling polish):
-{page_html[:4000]}
-
-Score 1-5 on each: positioning, audience_fit, value_clarity, cta_strength,
-tone_consistency.
-
-Return ONLY JSON:
-{{"scores": {{"positioning":0,"audience_fit":0,"value_clarity":0,"cta_strength":0,"tone_consistency":0}},
-  "notes": "one short paragraph: strongest and weakest aspects, naming the dimension each belongs to"}}"""
-    return parse_json(call_model(prompt, temperature=0.3))
+def run_editor(shop, strategy, html_template, images, new_images, feedback, status_box):
+    """One pass of the editor node: applies feedback to the current page and
+    returns the revised html_template (still holding IMAGE_n tokens). Any
+    new_images are appended after the existing ones so token numbering the
+    editor was told about lines up with the final render order."""
+    state = {
+        "shop": shop, "strategy": strategy, "html_template": html_template,
+        "images": images, "new_images": new_images, "feedback": feedback,
+    }
+    result = get_editor_pipeline().invoke(state)
+    status_box.write("Editor applied your feedback")
+    return result["html_template"]
 
 
 # ----------------------------------------------------------------------------
@@ -210,36 +62,6 @@ def strategy_to_md(shop, strategy):
     lines += ["**Key messages:**", ""]
     lines += [f"- {m}" for m in strategy["key_messages"]]
     return "\n".join(lines) + "\n"
-
-
-def score_to_md(shop, review):
-    sc = review["scores"]
-    avg = sum(sc.values()) / len(sc)
-    rows = "\n".join(
-        f"| {dim.replace('_', ' ').title()} | {val}/5 |" for dim, val in sc.items()
-    )
-    return f"""# Scorer — {shop['name']}
-
-| Dimension | Score |
-|---|---|
-{rows}
-| **Average** | **{avg:.2f}/5** |
-
-**Reviewer notes:** {review['notes']}
-
-_Note: the AI scores its own output — an LLM-as-judge limitation to flag in
-the critical discussion._
-"""
-
-
-def score_label(avg):
-    if avg >= 4.5:
-        return "Excellent — near-flawless execution (rare)", "success"
-    if avg >= 3.5:
-        return "Strong — solid execution, minor gaps", "success"
-    if avg >= 2.5:
-        return "Decent — meets the basics, real gaps remain", "warning"
-    return "Weak — strategy not well executed", "error"
 
 
 # ----------------------------------------------------------------------------
@@ -282,9 +104,8 @@ if not api_key:
     st.error("Add GEMINI_API_KEY to a .env file in the project root, then "
              "restart the app.")
 
-with st.expander("Pipeline & rubric"):
-    st.markdown("**Pipeline:** Strategist → Generator → Scorer")
-    st.markdown("**Rubric:** " + ", ".join(r.replace('_', ' ') for r in RUBRIC))
+with st.expander("Pipeline"):
+    st.markdown("**Pipeline:** Strategist → Generator")
 
 st.markdown('<hr class="bp-rule">', unsafe_allow_html=True)
 st.subheader("Tell me about the coffee shop")
@@ -318,31 +139,75 @@ if goal == "Get people to visit in person" and not address.strip():
         "match for the shop name instead of pointing at a real place."
     )
 
-if st.button("Generate page", type="primary", disabled=not api_key):
-    with st.spinner("1/3 — Strategist is making the marketing decisions"):
-        strategy = make_strategy(shop)
-    with st.spinner("2/3 — Generator is building the landing page"):
-        page_html = make_page(shop, strategy)
-    with st.spinner("3/3 — Scoring the result"):
-        review = score_page(shop, strategy, page_html)
+st.markdown("**Photos** (optional — used as real photos on the page instead "
+            "of placeholder gradients)")
+uploaded_photos = st.file_uploader(
+    "Upload shop photos", type=["png", "jpg", "jpeg", "webp"],
+    accept_multiple_files=True, label_visibility="collapsed",
+)
+if uploaded_photos:
+    n_cols = min(len(uploaded_photos), 6)
+    cols = st.columns(n_cols)
+    for i, photo in enumerate(uploaded_photos):
+        cols[i % n_cols].image(photo, use_container_width=True)
 
-    # stash for the report tab
+if st.button("Generate page", type="primary", disabled=not api_key):
+    images = [image_to_data_uri(f.getvalue()) for f in (uploaded_photos or [])]
+    with st.status("Running the LangGraph pipeline...", expanded=True) as status_box:
+        result = run_pipeline(shop, images, status_box)
+        status_box.update(label="Pipeline complete", state="complete")
+
+    # stash for the report tab — html_template keeps IMAGE_n tokens so the
+    # editor loop below never has to push base64 photos back through the LLM
     st.session_state["last"] = {
         "shop": shop.copy(),
-        "strategy": strategy,
-        "html": page_html,
-        "review": review,
+        "images": images,
+        "strategy": result["strategy"],
+        "html_template": result["html_template"],
     }
 
 if "last" in st.session_state:
     data = st.session_state["last"]
     generated_shop = data.get("shop", shop)
-    tab_page, tab_strategy, tab_score = st.tabs(["Page", "Strategy", "Score"])
+    rendered_html = _inject_images(data["html_template"], data["images"])
+    tab_page, tab_strategy = st.tabs(["Page", "Strategy"])
 
     with tab_page:
-        components.html(data["html"], height=700, scrolling=True)
-        st.download_button("Download page (HTML)", data["html"],
+        components.html(rendered_html, height=700, scrolling=True)
+        st.download_button("Download page (HTML)", rendered_html,
                            file_name="landing_page.html", mime="text/html")
+
+        st.markdown('<hr class="bp-rule">', unsafe_allow_html=True)
+        st.markdown("**Revise this page**")
+        st.caption("Tell the editor agent what to change — it edits the "
+                   "existing page rather than starting over, so the rest "
+                   "stays put. Give more feedback to keep refining.")
+        feedback = st.text_area(
+            "Your feedback", key="editor_feedback", label_visibility="collapsed",
+            placeholder="e.g. Add a new section showcasing our brownies, swap "
+                        "the social proof line for something about the "
+                        "pour-over bar, and make the CTA button bigger.",
+        )
+        uploader_key = f"editor_new_photos_{st.session_state.get('editor_uploader_gen', 0)}"
+        new_photos = st.file_uploader(
+            "Add photos for this revision (optional — e.g. a brownie photo "
+            "for a new section)",
+            type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True,
+            key=uploader_key,
+        )
+        if st.button("Apply revision", disabled=not (api_key and feedback.strip())):
+            new_images = [image_to_data_uri(f.getvalue()) for f in (new_photos or [])]
+            with st.status("Editor agent is revising the page...", expanded=True) as ebox:
+                new_template = run_editor(
+                    data["shop"], data["strategy"], data["html_template"],
+                    data["images"], new_images, feedback, ebox,
+                )
+                ebox.update(label="Revision applied", state="complete")
+            data["html_template"] = new_template
+            data["images"] = data["images"] + new_images
+            st.session_state["last"] = data
+            st.session_state["editor_uploader_gen"] = st.session_state.get("editor_uploader_gen", 0) + 1
+            st.rerun()
 
     with tab_strategy:
         s = data["strategy"]
@@ -359,20 +224,3 @@ if "last" in st.session_state:
         st.download_button("Download strategist output (.md)",
                            strategy_to_md(generated_shop, s),
                            file_name="strategist.md", mime="text/markdown")
-
-    with tab_score:
-        sc = data["review"]["scores"]
-        avg = sum(sc.values()) / len(sc)
-        label, kind = score_label(avg)
-        getattr(st, kind)(f"{label} — average {avg:.2f}/5")
-        st.caption("Scale: 1 weak · 2 below average · 3 decent · 4 strong · "
-                   "5 exceptional (rare — means the reviewer found zero faults).")
-        cols = st.columns(len(sc))
-        for col, (dim, val) in zip(cols, sc.items()):
-            col.metric(dim.replace("_", " "), f"{val}/5")
-        st.markdown(f"**Reviewer notes:** {data['review']['notes']}")
-        st.caption("Note: the AI scores its own output — an LLM-as-judge "
-                   "limitation to flag in your critical discussion.")
-        st.download_button("Download scorer output (.md)",
-                           score_to_md(shop, data["review"]),
-                           file_name="scorer.md", mime="text/markdown")
